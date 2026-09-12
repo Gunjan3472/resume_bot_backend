@@ -207,10 +207,10 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# CORS — allow the Next.js dev server
+# CORS — allow all origins (Vercel frontend + local dev)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -253,10 +253,13 @@ async def root():
 
 
 @app.post("/chat")
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, stream: bool = False):
     """
     Receive a question, combine it with the parsed resume context,
-    stream the Groq LLM response back as Server-Sent Events (SSE).
+    query the Groq LLM, and return the AI's answer.
+
+    Query params:
+        stream: If true, returns Server-Sent Events. Otherwise returns JSON.
     """
     try:
         resume = get_parsed_resume()
@@ -296,43 +299,51 @@ async def chat(request: ChatRequest):
         f"{resume_json}"
     )
 
-    async def stream_response():
-        """Generator that yields SSE chunks from the Groq stream."""
-        try:
-            stream = get_groq_client().chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": request.question},
-                ],
-                temperature=0.7,
-                max_tokens=1024,
-                stream=True,
-            )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": request.question},
+    ]
 
-            for chunk in stream:
-                delta = chunk.choices[0].delta
-                if delta.content:
-                    # Send each token as an SSE event
-                    data = json.dumps({"content": delta.content})
-                    yield f"data: {data}\n\n"
+    # ── Streaming mode (SSE) ──
+    if stream:
+        async def stream_response():
+            try:
+                chunks = get_groq_client().chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    temperature=0.7,
+                    max_tokens=1024,
+                    stream=True,
+                )
+                for chunk in chunks:
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        data = json.dumps({"content": delta.content})
+                        yield f"data: {data}\n\n"
+                yield "data: [DONE]\n\n"
+            except Exception as exc:
+                error_data = json.dumps({"error": str(exc)})
+                yield f"data: {error_data}\n\n"
+                yield "data: [DONE]\n\n"
 
-            # Signal that the stream is done
-            yield "data: [DONE]\n\n"
+        return StreamingResponse(
+            stream_response(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
 
-        except Exception as exc:
-            error_data = json.dumps({"error": str(exc)})
-            yield f"data: {error_data}\n\n"
-            yield "data: [DONE]\n\n"
-
-    return StreamingResponse(
-        stream_response(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        },
-    )
+    # ── Normal mode (JSON) ──
+    try:
+        response = get_groq_client().chat.completions.create(
+            model=MODEL_NAME,
+            messages=messages,
+            temperature=0.7,
+            max_tokens=1024,
+        )
+        answer: str = response.choices[0].message.content or ""
+        return {"answer": answer}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"LLM query failed: {exc}") from exc
 
 
 # ──────────────────────────────────────────────
